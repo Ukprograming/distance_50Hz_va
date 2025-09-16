@@ -3,8 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot + MA + x/v/a</title>
+<title>VL53L0X Live Plot + MA + x/v/a (safe)</title>
 <link rel="icon" href="data:,">
+<!-- Chart.js はCDN障害でも落ちないよう defer で読み込み、未ロード時はノーグラフで動作 -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4" defer></script>
 <style>
   :root { --gap:10px; }
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:16px; }
@@ -14,16 +16,25 @@
   #status { font-weight:700; }
   .grid { display:grid; grid-template-columns: 1fr 360px; gap:12px; align-items:start; }
   .box { border:1px solid #e5e7eb; border-radius:8px; padding:10px; }
-  #chartWrap { width:100%; height:520px; }
-  canvas { width:100% !important; height:100% !important; }
+  #chartWrap { width:100%; height:520px; display:grid; place-items:center; color:#64748b; }
+  canvas { width:100% !important; height:100% !important; display:none; }
   #log { height:180px; overflow:auto; background:#fafafa; font:12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; }
   .kv { font-size:13px; line-height:1.5; }
   .kv span { display:inline-block; min-width:150px; color:#334155; }
   .badge { display:inline-block; padding:2px 6px; border-radius:6px; font-size:12px; }
   .ok { background:#e6ffed; color:#065f46; border:1px solid #bbf7d0; }
   .ng { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+  .pill { padding:2px 8px; border-radius:999px; border:1px solid #cbd5e1; font-size:12px; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+
+<!-- どこで止まってもLogに出す“早期ロガー” -->
+<script>
+  (function(){
+    const q=[]; window.logEarly = s => { q.push(s); const el=document.getElementById('log'); if(el){ while(q.length){ el.textContent += q.shift()+'\n'; el.scrollTop=el.scrollHeight; } } console.log(s); };
+    window.addEventListener('error', e => logEarly('[js error] '+(e?.message||e)));
+    window.addEventListener('unhandledrejection', e => logEarly('[promise rej] '+(e?.reason?.message||e?.reason)));
+  })();
+</script>
 </head>
 <body>
   <h1>VL53L0X Live Plot</h1>
@@ -53,7 +64,10 @@
   </div>
 
   <div class="grid">
-    <div id="chartWrap" class="box"><canvas id="chart"></canvas></div>
+    <div id="chartWrap" class="box">
+      <canvas id="chart"></canvas>
+      <div id="noChart">（Chart.js未ロードでも受信・CSVは動作します）</div>
+    </div>
     <div class="box">
       <div class="kv"><span>Browser:</span><b id="bName">—</b></div>
       <div class="kv"><span>Secure context:</span><span id="bSecure" class="badge">—</span></div>
@@ -73,245 +87,172 @@
 
 <script>
 (() => {
-  // ===== Env diagnostics =====
   const $ = id => document.getElementById(id);
-  const bName = $('bName'), bSecure = $('bSecure'), bSerial = $('bSerial'), bTop = $('bTop'), bPorts = $('bPorts');
-  const statusEl = $('status'), rxHzEl = $('rxHz'), lastRawEl = $('lastRaw'), lastFiltEl = $('lastFilt'), maDelayEl = $('maDelay'), recCountEl = $('recCount'), logEl = $('log');
+  const log = s => { logEarly(s); }; // 早期ロガーに合流
 
-  function badge(el, ok) {
-    el.className = 'badge ' + (ok ? 'ok' : 'ng');
-    el.textContent = ok ? 'OK' : 'NG';
-  }
+  // ===== Env diagnostics =====
+  const bName=$('bName'), bSecure=$('bSecure'), bSerial=$('bSerial'), bTop=$('bTop'), bPorts=$('bPorts');
+  const statusEl=$('status'), rxHzEl=$('rxHz'), lastRawEl=$('lastRaw'), lastFiltEl=$('lastFilt'), maDelayEl=$('maDelay'), recCountEl=$('recCount');
+
+  function badge(el, ok){ el.className='badge ' + (ok?'ok':'ng'); el.textContent = ok ? 'OK' : 'NG'; }
   bName.textContent = navigator.userAgent;
   badge(bSecure, window.isSecureContext);
   badge(bSerial, 'serial' in navigator);
-  const isTop = (window.top === window.self);
-  badge(bTop, isTop);
+  badge(bTop, window.top === window.self);
+  (async()=>{ if(!('serial' in navigator)){ bPorts.textContent='—'; return; }
+    try{ const ports=await navigator.serial.getPorts(); bPorts.textContent=String(ports.length);}catch{ bPorts.textContent='error'; }
+  })();
 
-  async function updateGrantedPorts() {
-    if (!('serial' in navigator)) { bPorts.textContent = '—'; return; }
-    try {
-      const ports = await navigator.serial.getPorts();
-      bPorts.textContent = String(ports.length);
-    } catch {
-      bPorts.textContent = 'error';
-    }
+  // ===== Chart (safe) =====
+  let chart=null, chartReady=false;
+  const canvas=$('chart'), noChart=$('noChart');
+  function requestUpdate(){ if(!chartReady) return; if(requestUpdate._id) return; requestUpdate._id=requestAnimationFrame(()=>{ chart.update('none'); requestUpdate._id=0; }); }
+
+  function ensureChart(){
+    if (typeof Chart==='undefined') { log('[chart] not loaded → no-graph mode'); return; }
+    canvas.style.display='block'; noChart.style.display='none';
+    const data={labels:[],datasets:[{label:'Distance [mm] (filtered)',data:[],tension:0,pointRadius:0,parsing:false}]};
+    chart=new Chart(canvas.getContext('2d'),{
+      type:'line', data,
+      options:{
+        animation:false, responsive:true, normalized:true,
+        scales:{ x:{type:'linear', title:{display:true,text:'Time [s]'},min:0,max:10},
+                 y:{beginAtZero:true, title:{display:true,text:'Distance [mm]'}, suggestedMax:1000} },
+        plugins:{ legend:{display:false} }
+      }
+    });
+    chartReady=true;
+    log('[chart] ready');
   }
-  updateGrantedPorts();
-
-  function log(s){ logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
-
-  // ===== Chart =====
-  const ctx = document.getElementById('chart');
-  const data = { labels: [], datasets: [{ label:'Distance [mm] (filtered)', data: [], tension:0, pointRadius:0, parsing:false }]};
-  const chart = new Chart(ctx, {
-    type: 'line',
-    data,
-    options: {
-      animation: false,
-      responsive: true,
-      normalized: true,
-      scales: {
-        x: { type:'linear', title:{display:true, text:'Time [s]'}, min:0, max:10 },
-        y: { beginAtZero:true, title:{display:true, text:'Distance [mm]'}, suggestedMax:1000 }
-      },
-      plugins: { legend:{ display:false } }
-    }
-  });
-
-  let xWindow = 10;
-  function pushPoint(tSec, y) {
-    if (!Number.isFinite(y)) return;
-    data.datasets[0].data.push({ x:tSec, y });
-    const sMax = chart.options.scales.y.suggestedMax ?? 1000;
-    if (y > sMax) chart.options.scales.y.suggestedMax = Math.ceil(y / 200) * 200;
-    if (tSec > xWindow) {
-      xWindow = Math.ceil(tSec / 10) * 10;
-      chart.options.scales.x.max = xWindow;
-    }
-    requestUpdate();
-  }
-  let rafId=null, needs=false;
-  function requestUpdate() {
-    if (rafId) { needs=true; return; }
-    rafId = requestAnimationFrame(() => { chart.update('none'); rafId=null; if (needs){ needs=false; requestUpdate(); }});
-  }
+  // DOM構築後にChart生成（deferでも万一未ロードならno-graph）
+  if (document.readyState==='loading') {
+    document.addEventListener('DOMContentLoaded', ensureChart);
+  } else { ensureChart(); }
 
   // ===== Moving Average =====
-  const maNInput = $('maN');
-  const maNView  = $('maNView');
-  let MA_N = 5;
-  const maBuf = []; let maSum = 0;
+  const maNInput=$('maN'), maNView=$('maNView');
+  let MA_N=5; const maBuf=[]; let maSum=0;
   function resetMA(){ maBuf.length=0; maSum=0; }
-  function setMAN(n){
-    MA_N = Math.max(1, Math.min(31, Math.floor(n||1)));
-    maNInput.value = MA_N; maNView.textContent = String(MA_N);
-    resetMA(); updateDelayEstimate();
-    // 窓を変えたら表示再構築（v/aも影響）
-    rebuildSeries();
-  }
-  setMAN(Number(maNInput.value) || 5);
-  maNInput.addEventListener('change', () => setMAN(maNInput.value));
-  maNInput.addEventListener('input',  () => setMAN(maNInput.value));
-  function maFilter(x){
-    if (MA_N <= 1) return x; // N=1 は生データ
-    maBuf.push(x); maSum += x;
-    if (maBuf.length > MA_N) maSum -= maBuf.shift();
-    if (maBuf.length < MA_N) return null;
-    return maSum / MA_N;
-  }
-  function updateDelayEstimate(){
-    const hz = parseFloat(rxHzEl.textContent) || 0;
-    if (!hz) { maDelayEl.textContent = '—'; return; }
-    const delay_ms = ((MA_N - 1) / (2 * hz)) * 1000;
-    maDelayEl.textContent = String(Math.round(delay_ms));
-  }
+  function setMAN(n){ MA_N=Math.max(1,Math.min(31,Math.floor(n||1))); maNInput.value=MA_N; maNView.textContent=String(MA_N); resetMA(); updateDelayEstimate(); rebuildSeries(); }
+  function maFilter(x){ if(MA_N<=1) return x; maBuf.push(x); maSum+=x; if(maBuf.length>MA_N) maSum-=maBuf.shift(); if(maBuf.length<MA_N) return null; return maSum/MA_N; }
+  function updateDelayEstimate(){ const hz=parseFloat(rxHzEl.textContent)||0; maDelayEl.textContent = hz? String(Math.round(((MA_N-1)/(2*hz))*1000)) : '—'; }
+  setMAN(Number(maNInput.value)||5);
+  maNInput.addEventListener('change',()=>setMAN(maNInput.value));
+  maNInput.addEventListener('input', ()=>setMAN(maNInput.value));
 
   // ===== Records & derived series =====
-  // mm_filtered は小数のまま保存（微分精度のため）。CSV出力時に丸めます。
-  const records = []; // {t, mm_raw, mm_filtered}
-
-  function seriesX(){
-    return records.map(r => ({ t: r.t, y: r.mm_filtered }));
-  }
-  // 不等間隔対応・中央差分（端点は片側差分）
+  const records=[]; // {t, mm_raw, mm_filtered}
+  function seriesX(){ return records.map(r=>({t:r.t, y:r.mm_filtered})); }
   function seriesV(){
-    const n = records.length; if (n < 2) return [];
-    const out = [];
-    for (let i=0;i<n;i++){
+    const n=records.length; if(n<2) return [];
+    const out=[];
+    for(let i=0;i<n;i++){
       let v=null;
-      if (i>0 && i<n-1){
+      if(i>0 && i<n-1){
         const t0=records[i-1].t/1000, t2=records[i+1].t/1000;
         const x0=records[i-1].mm_filtered, x2=records[i+1].mm_filtered;
-        const dt=t2-t0; if (dt>0) v=(x2-x0)/dt; // mm/s
-      } else if (i===0){
-        const dt=(records[1].t-records[0].t)/1000;
-        if (dt>0) v=(records[1].mm_filtered-records[0].mm_filtered)/dt;
-      } else {
-        const dt=(records[i].t-records[i-1].t)/1000;
-        if (dt>0) v=(records[i].mm_filtered-records[i-1].mm_filtered)/dt;
+        const dt=t2-t0; if(dt>0) v=(x2-x0)/dt;
+      }else if(i===0){
+        const dt=(records[1].t-records[0].t)/1000; if(dt>0) v=(records[1].mm_filtered-records[0].mm_filtered)/dt;
+      }else{
+        const dt=(records[i].t-records[i-1].t)/1000; if(dt>0) v=(records[i].mm_filtered-records[i-1].mm_filtered)/dt;
       }
-      if (v!=null && isFinite(v)) out.push({ t: records[i].t, y: v });
+      if(v!=null && isFinite(v)) out.push({t:records[i].t, y:v});
     }
     return out;
   }
-  // a = 2*((x2-x1)/dt12 - (x1-x0)/dt01) / (t2-t0)
   function seriesA(){
-    const n = records.length; if (n < 3) return [];
-    const out = [];
-    for (let i=1;i<n-1;i++){
+    const n=records.length; if(n<3) return [];
+    const out=[];
+    for(let i=1;i<n-1;i++){
       const t0=records[i-1].t/1000, t1=records[i].t/1000, t2=records[i+1].t/1000;
       const x0=records[i-1].mm_filtered, x1=records[i].mm_filtered, x2=records[i+1].mm_filtered;
       const dt01=t1-t0, dt12=t2-t1, dt02=t2-t0;
-      if (dt01<=0 || dt12<=0 || dt02<=0) continue;
-      const a = 2 * ( (x2-x1)/dt12 - (x1-x0)/dt01 ) / dt02; // mm/s^2
-      if (isFinite(a)) out.push({ t: records[i].t, y: a });
+      if(dt01<=0||dt12<=0||dt02<=0) continue;
+      const a=2*((x2-x1)/dt12 - (x1-x0)/dt01)/dt02;
+      if(isFinite(a)) out.push({t:records[i].t, y:a});
     }
     return out;
   }
 
-  // ===== View handling =====
-  let currentView = 'x'; // 'x' | 'v' | 'a'
-  function setView(v){
-    currentView = v;
-    if (v==='x'){
-      chart.options.scales.y.beginAtZero = true;
-      chart.options.scales.y.title.text = 'Distance [mm]';
-      chart.options.scales.y.suggestedMax = 1000;
-    } else {
-      chart.options.scales.y.beginAtZero = false;
-      chart.options.scales.y.title.text = (v==='v') ? 'Velocity [mm/s]' : 'Acceleration [mm/s²]';
-      // 対称レンジに近い suggestedMin/Max を設定（後でオート拡張）
-      chart.options.scales.y.suggestedMin = -1000;
-      chart.options.scales.y.suggestedMax = 1000;
-    }
-    rebuildSeries();
+  // ===== Chart helpers =====
+  let xWindow=10;
+  function pushPoint(tSec,y){
+    if(!chartReady) return; if(!Number.isFinite(y)) return;
+    chart.data.datasets[0].data.push({x:tSec,y});
+    const sMax=chart.options.scales.y.suggestedMax??1000;
+    if (chart.options.scales.y.beginAtZero && y>sMax) chart.options.scales.y.suggestedMax=Math.ceil(y/200)*200;
+    if (tSec>xWindow){ xWindow=Math.ceil(tSec/10)*10; chart.options.scales.x.max=xWindow; }
+    requestUpdate();
   }
-  function autoscaleForSeries(ser, step){
-    if (!ser.length) return;
-    let maxAbs = 0;
-    for (const p of ser) { const a = Math.abs(p.y); if (a > maxAbs) maxAbs = a; }
-    if (maxAbs === 0) return;
-    const target = Math.ceil(maxAbs / step) * step;
-    if (currentView==='x'){
-      chart.options.scales.y.suggestedMax = Math.max(chart.options.scales.y.suggestedMax ?? step, target);
-    } else {
-      chart.options.scales.y.suggestedMax = target;
-      chart.options.scales.y.suggestedMin = -target;
+  let currentView='x';
+  function autoscaleForSeries(ser, step, symmetric=false){
+    if(!chartReady||!ser.length) return;
+    if(symmetric){
+      let maxAbs=0; for(const p of ser){ const a=Math.abs(p.y); if(a>maxAbs) maxAbs=a; }
+      const tgt=Math.max(step, Math.ceil(maxAbs/step)*step);
+      chart.options.scales.y.suggestedMin=-tgt; chart.options.scales.y.suggestedMax=tgt;
+    }else{
+      let max=0; for(const p of ser){ if(p.y>max) max=p.y; }
+      const tgt=Math.max(step, Math.ceil(max/step)*step);
+      chart.options.scales.y.suggestedMax=tgt;
     }
   }
   function rebuildSeries(){
+    if(!chartReady) return;
     let ser;
-    if (currentView==='x') {
-      ser = seriesX();
-      data.datasets[0].label = 'Distance [mm] (filtered)';
-      data.datasets[0].data = ser.map(p => ({ x: p.t/1000, y: p.y }));
-      autoscaleForSeries(ser, 200);
-    } else if (currentView==='v') {
-      ser = seriesV();
-      data.datasets[0].label = 'Velocity [mm/s]';
-      data.datasets[0].data = ser.map(p => ({ x: p.t/1000, y: p.y }));
-      autoscaleForSeries(ser, 200);
-    } else {
-      ser = seriesA();
-      data.datasets[0].label = 'Acceleration [mm/s²]';
-      data.datasets[0].data = ser.map(p => ({ x: p.t/1000, y: p.y }));
-      autoscaleForSeries(ser, 500);
+    if(currentView==='x'){
+      ser=seriesX();
+      chart.data.datasets[0].label='Distance [mm] (filtered)';
+      chart.options.scales.y.beginAtZero=true;
+      chart.options.scales.y.title.text='Distance [mm]';
+      chart.options.scales.y.suggestedMin=0; chart.options.scales.y.suggestedMax=1000;
+      chart.data.datasets[0].data=ser.map(p=>({x:p.t/1000,y:p.y}));
+      autoscaleForSeries(ser,200,false);
+    }else if(currentView==='v'){
+      ser=seriesV();
+      chart.data.datasets[0].label='Velocity [mm/s]';
+      chart.options.scales.y.beginAtZero=false;
+      chart.options.scales.y.title.text='Velocity [mm/s]';
+      chart.data.datasets[0].data=ser.map(p=>({x:p.t/1000,y:p.y}));
+      autoscaleForSeries(ser,200,true);
+    }else{
+      ser=seriesA();
+      chart.data.datasets[0].label='Acceleration [mm/s²]';
+      chart.options.scales.y.beginAtZero=false;
+      chart.options.scales.y.title.text='Acceleration [mm/s²]';
+      chart.data.datasets[0].data=ser.map(p=>({x:p.t/1000,y:p.y}));
+      autoscaleForSeries(ser,500,true);
     }
-    const lastT = ser.length ? ser[ser.length-1].t/1000 : 0;
-    xWindow = Math.max(10, Math.ceil(lastT/10)*10);
-    chart.options.scales.x.max = xWindow;
+    const lastT=ser.length? ser[ser.length-1].t/1000 : 0;
+    xWindow=Math.max(10,Math.ceil(lastT/10)*10);
+    chart.options.scales.x.max=xWindow;
     requestUpdate();
   }
-  setView('x');
+  function setView(v){ currentView=v; rebuildSeries(); }
 
   // ===== CSV =====
-  function downloadCsvX(){
-    if (!records.length) return;
-    const header = 't_ms,mm_raw,mm_filtered,cm_filtered\n';
-    const body = records.map(r => `${r.t},${Math.round(r.mm_raw)},${Math.round(r.mm_filtered)},${(r.mm_filtered/10).toFixed(1)}`).join('\n')+'\n';
-    triggerCsv(header+body, 'xt.csv');
-  }
-  function downloadCsvV(){
-    const s = seriesV(); if (!s.length) return;
-    const header = 't_ms,vel_mm_per_s,vel_cm_per_s\n';
-    const body = s.map(p => `${p.t},${p.y.toFixed(3)},${(p.y/10).toFixed(3)}`).join('\n')+'\n';
-    triggerCsv(header+body, 'vt.csv');
-  }
-  function downloadCsvA(){
-    const s = seriesA(); if (!s.length) return;
-    const header = 't_ms,acc_mm_per_s2,acc_m_per_s2\n';
-    const body = s.map(p => `${p.t},${p.y.toFixed(3)},${(p.y/1000).toFixed(6)}`).join('\n')+'\n';
-    triggerCsv(header+body, 'at.csv');
-  }
-  function triggerCsv(text, filename){
-    const blob = new Blob([text], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  }
+  function triggerCsv(text, name){ const blob=new Blob([text],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); }
+  function downloadCsvX(){ if(!records.length) return; const header='t_ms,mm_raw,mm_filtered,cm_filtered\n'; const body=records.map(r=>`${r.t},${Math.round(r.mm_raw)},${Math.round(r.mm_filtered)},${(r.mm_filtered/10).toFixed(1)}`).join('\n')+'\n'; triggerCsv(header+body,'xt.csv'); }
+  function downloadCsvV(){ const s=seriesV(); if(!s.length) return; const header='t_ms,vel_mm_per_s,vel_cm_per_s\n'; const body=s.map(p=>`${p.t},${p.y.toFixed(3)},${(p.y/10).toFixed(3)}`).join('\n')+'\n'; triggerCsv(header+body,'vt.csv'); }
+  function downloadCsvA(){ const s=seriesA(); if(!s.length) return; const header='t_ms,acc_mm_per_s2,acc_m_per_s2\n'; const body=s.map(p=>`${p.t},${p.y.toFixed(3)},${(p.y/1000).toFixed(6)}`).join('\n')+'\n'; triggerCsv(header+body,'at.csv'); }
 
-  // ===== Serial plumbing（元のまま） =====
+  // ===== Serial plumbing（堅牢） =====
   let port=null, reader=null, reading=false;
-  let streaming=false; let t0=0;
-  let rxTimes=[];
+  let streaming=false, t0=0, rxTimes=[];
 
-  async function startReading() {
-    const textDecoder = new TextDecoderStream();
+  async function startReading(){
+    const textDecoder=new TextDecoderStream();
     port.readable.pipeTo(textDecoder.writable).catch(()=>{});
-    reader = textDecoder.readable.getReader();
-    let buf=''; reading=true;
-    log('[reader] started');
-    while (reading) {
-      let chunk;
-      try { chunk = await reader.read(); } catch(e){ log('[reader] error: '+e); break; }
-      if (!chunk || chunk.done) break;
-      const value = chunk.value; if (!value) continue;
-      buf += value;
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).replace(/\r$/, '').trim();
-        buf = buf.slice(idx+1);
+    reader=textDecoder.readable.getReader();
+    let buf=''; reading=true; log('[reader] started');
+    while(reading){
+      let chunk; try{ chunk=await reader.read(); }catch(e){ log('[reader] error: '+(e?.message||e)); break; }
+      if(!chunk || chunk.done) break;
+      const value=chunk.value; if(!value) continue;
+      buf+=value;
+      let idx; while((idx=buf.indexOf('\n'))>=0){
+        const line=buf.slice(0,idx).replace(/\r$/,'').trim(); buf=buf.slice(idx+1);
         handleLine(line);
       }
     }
@@ -319,96 +260,92 @@
   }
 
   function handleLine(line){
-    if (!line) return;
-    if (line.includes('TIMEOUT')) { log('[skip] TIMEOUT'); return; }
-    const m = line.match(/-?\d{1,6}/);
-    if (!m) { return; }
-    const mmRaw = parseInt(m[0],10);
-    lastRawEl.textContent = String(mmRaw);
+    if(!line) return;
+    if(line.includes('TIMEOUT')) return;
+    const m=line.match(/-?\d{1,6}/);
+    if(!m) return;
+    const mmRaw=parseInt(m[0],10);
+    lastRawEl.textContent=String(mmRaw);
 
-    const now = performance.now();
-    rxTimes.push(now);
-    while (rxTimes.length && now - rxTimes[0] > 1000) rxTimes.shift();
-    rxHzEl.textContent = String(rxTimes.length);
-    updateDelayEstimate();
+    const now=performance.now();
+    rxTimes.push(now); while(rxTimes.length && now-rxTimes[0]>1000) rxTimes.shift();
+    rxHzEl.textContent=String(rxTimes.length); updateDelayEstimate();
 
-    if (!streaming) return;
-    if (!t0) t0 = now;
-    const t_ms = Math.round(now - t0);
+    if(!streaming) return;
+    if(!t0) t0=now;
+    const t_ms=Math.round(now-t0);
 
-    const y = maFilter(mmRaw);
-    if (y == null) return;
-    lastFiltEl.textContent = String(Math.round(y));
-    records.push({ t: t_ms, mm_raw: mmRaw, mm_filtered: y });
-    recCountEl.textContent = String(records.length);
+    const y=maFilter(mmRaw);
+    if(y==null) return;
 
-    // 表示中のビューに応じて更新方法を変更
-    if (currentView === 'x') {
-      pushPoint(t_ms/1000, y);   // x–tは従来通り1点追加で高速
-    } else {
-      rebuildSeries();           // v/aは中央差分のため都度再計算
-    }
+    lastFiltEl.textContent=String(Math.round(y));
+    records.push({t:t_ms, mm_raw:mmRaw, mm_filtered:y});
+    recCountEl.textContent=String(records.length);
+
+    if(currentView==='x') pushPoint(t_ms/1000, y); else rebuildSeries();
   }
 
-  // ===== Buttons =====
+  // ===== Buttons（Connectは必ずLogを出す） =====
   $('btnConnect').addEventListener('click', async () => {
-    if (!window.isSecureContext) { alert('このページは HTTPS か localhost で開いてください（file:// は不可）。'); log('[connect] insecure context'); return; }
-    if (!('serial' in navigator)) { alert('Web Serial未対応です。Chrome/Edge(デスクトップ)で開いてください。'); log('[connect] no navigator.serial'); return; }
-    try {
-      const p = await navigator.serial.requestPort();
-      await p.open({ baudRate: 9600 }); // 例スケッチ
-      port = p;
-      statusEl.textContent = 'CONNECTED';
-      log('[open] ok 9600bps');
-      streaming = true; t0=0; resetMA(); records.length=0; recCountEl.textContent='0';
-      // 表示をクリア
-      data.datasets[0].data.length = 0; chart.options.scales.x.max = 10; xWindow = 10; requestUpdate();
+    log('[ui] connect clicked');
+    if(!window.isSecureContext){ alert('HTTPS または localhost で開いてください（file:// は不可）。'); log('[connect] insecure context'); return; }
+    if(!('serial' in navigator)){ alert('Web Serial未対応です（Chrome/Edge デスクトップ）。'); log('[connect] no navigator.serial'); return; }
+    // 既存をクローズしてから
+    try{ if(reader) await reader.cancel(); }catch{} try{ if(reader){ reader.releaseLock(); reader=null; } }catch{} try{ if(port) await port.close(); }catch{}
+    try{
+      const p=await navigator.serial.requestPort();
+      await p.open({baudRate:9600});
+      port=p; statusEl.textContent='CONNECTED'; log('[open] ok 9600bps');
+      streaming=true; t0=0; resetMA(); records.length=0; recCountEl.textContent='0';
+      if(chartReady){ chart.data.datasets[0].data.length=0; chart.options.scales.x.max=10; xWindow=10; requestUpdate(); }
       startReading();
-      updateGrantedPorts();
-    } catch (e) {
-      if (e && e.name === 'NotFoundError') { log('[connect] user canceled port picker'); }
-      else { alert('Serial接続に失敗: ' + (e && (e.message || e.name))); log('[connect] error: ' + e); }
+      // Ports更新
+      try{ const ports=await navigator.serial.getPorts(); bPorts.textContent=String(ports.length);}catch{}
+    }catch(e){
+      if(e && e.name==='NotFoundError'){ log('[connect] user canceled port picker'); }
+      else{ alert('Serial接続に失敗: '+(e?.message||e)); log('[connect] error: '+(e?.message||e)); }
     }
   });
 
   $('btnDisconnect').addEventListener('click', async () => {
     streaming=false; reading=false;
-    try { if (reader) await reader.cancel(); } catch {}
-    try { if (reader) { reader.releaseLock(); reader=null; } } catch {}
-    try { if (port) await port.close(); } catch {}
+    try{ if(reader) await reader.cancel(); }catch{}
+    try{ if(reader){ reader.releaseLock(); reader=null; } }catch{}
+    try{ if(port) await port.close(); }catch{}
     port=null; statusEl.textContent='DISCONNECTED'; log('[close] done');
   });
 
   $('btnStart').addEventListener('click', () => {
-    if (!port) { alert('先にConnectしてください'); return; }
-    streaming = true; t0=0; resetMA(); statusEl.textContent='STREAMING'; log('[stream] start');
+    log('[ui] start clicked');
+    if(!port){ alert('先にConnectしてください'); return; }
+    streaming=true; t0=0; resetMA(); statusEl.textContent='STREAMING'; log('[stream] start');
   });
   $('btnStop').addEventListener('click', () => {
-    streaming = false; statusEl.textContent='STOPPED'; log('[stream] stop');
+    log('[ui] stop clicked');
+    streaming=false; statusEl.textContent='STOPPED'; log('[stream] stop');
   });
   $('btnReset').addEventListener('click', () => {
+    log('[ui] reset clicked');
     streaming=false;
-    data.datasets[0].data.length=0;
+    if(chartReady){
+      chart.data.datasets[0].data.length=0;
+      chart.options.scales.x.min=0; chart.options.scales.x.max=10;
+      if(currentView==='x'){ chart.options.scales.y.beginAtZero=true; chart.options.scales.y.suggestedMin=0; chart.options.scales.y.suggestedMax=1000; }
+      else { chart.options.scales.y.beginAtZero=false; chart.options.scales.y.suggestedMin=-1000; chart.options.scales.y.suggestedMax=1000; }
+      requestUpdate();
+    }
     records.length=0; recCountEl.textContent='0';
-    chart.options.scales.x.min=0; chart.options.scales.x.max=10;
-    // ビュー別の初期Yレンジ
-    if (currentView==='x'){ chart.options.scales.y.beginAtZero=true; chart.options.scales.y.suggestedMax=1000; }
-    else{ chart.options.scales.y.beginAtZero=false; chart.options.scales.y.suggestedMin=-1000; chart.options.scales.y.suggestedMax=1000; }
-    xWindow=10; chart.update('none'); t0=0;
     lastRawEl.textContent='—'; lastFiltEl.textContent='—'; rxHzEl.textContent='0'; maDelayEl.textContent='—';
-    resetMA(); log('[reset] ui cleared'); statusEl.textContent='RESET';
+    t0=0; resetMA(); statusEl.textContent='RESET'; log('[reset] ui cleared');
   });
 
-  // 既存の x–t CSV（互換）
-  $('btnCsv').addEventListener('click', () => downloadCsvX());
-  // 追加：v–t / a–t CSV
-  $('btnCsvV').addEventListener('click', () => downloadCsvV());
-  $('btnCsvA').addEventListener('click', () => downloadCsvA());
+  $('btnViewX').addEventListener('click', ()=>{ setView('x'); });
+  $('btnViewV').addEventListener('click', ()=>{ setView('v'); });
+  $('btnViewA').addEventListener('click', ()=>{ setView('a'); });
 
-  // View切り替え
-  $('btnViewX').addEventListener('click', () => setView('x'));
-  $('btnViewV').addEventListener('click', () => setView('v'));
-  $('btnViewA').addEventListener('click', () => setView('a'));
+  $('btnCsv').addEventListener('click', ()=>downloadCsvX());
+  $('btnCsvV').addEventListener('click', ()=>downloadCsvV());
+  $('btnCsvA').addEventListener('click', ()=>downloadCsvA());
 })();
 </script>
 </body>
